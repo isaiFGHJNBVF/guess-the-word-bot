@@ -137,10 +137,14 @@ async def interaction_owner_game_state(interaction: discord.Interaction) -> Opti
 
 
 @tree.command(name="setup", description="Set up the word game in a channel")
+@app_commands.default_permissions(administrator=True)
 @app_commands.describe(channel="The channel where the game should run")
 async def setup(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
         await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Only server administrators can use `/setup`.", ephemeral=True)
         return
     try:
         role = await get_or_create_joined_role(interaction.guild)
