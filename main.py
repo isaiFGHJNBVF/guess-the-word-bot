@@ -1,14 +1,23 @@
 import asyncio
+import logging
 import os
 import random
 from dataclasses import dataclass, field
 from typing import Optional
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
 import discord
 from discord import app_commands
 
 TOKEN_ENV_NAME = "DISCORD_BOT_TOKEN"
 JOINED_ROLE_SUFFIX = "+joined"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("word-game-bot")
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -18,6 +27,7 @@ intents.message_content = True
 
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
+_synced_commands = False
 
 
 @dataclass
@@ -35,6 +45,11 @@ class GameState:
 
 
 games: dict[int, GameState] = {}
+
+
+def load_environment() -> None:
+    if load_dotenv:
+        load_dotenv()
 
 
 def joined_role_name() -> str:
@@ -63,16 +78,12 @@ async def end_game_for_guild(guild: discord.Guild) -> Optional[GameState]:
         for member in list(role.members):
             try:
                 await member.remove_roles(role, reason="Game ended")
-            except discord.Forbidden:
-                pass
-            except discord.HTTPException:
-                pass
+            except (discord.Forbidden, discord.HTTPException):
+                logger.warning("Could not remove joined role from member %s", member.id)
         try:
             await role.delete(reason="Game ended")
-        except discord.Forbidden:
-            pass
-        except discord.HTTPException:
-            pass
+        except (discord.Forbidden, discord.HTTPException):
+            logger.warning("Could not delete joined role %s", role.id)
     return state
 
 
@@ -112,7 +123,9 @@ async def start_next_round(state: GameState) -> None:
     state.current_player_id = selected.id
     state.current_word = None
     state.accepting_guess = False
-    await channel.send(f"Round {state.round_number}: {selected.mention}, set the secret word with `/word <word>`. Everyone else, get ready to guess.")
+    await channel.send(
+        f"Round {state.round_number}: {selected.mention}, set the secret word with `/word <word>`. Everyone else, get ready to guess."
+    )
 
 
 async def interaction_game_state(interaction: discord.Interaction) -> Optional[GameState]:
@@ -146,6 +159,9 @@ async def setup(interaction: discord.Interaction, channel: discord.TextChannel) 
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Only server administrators can use `/setup`.", ephemeral=True)
         return
+    old_state = games.get(interaction.guild.id)
+    if old_state:
+        await end_game_for_guild(interaction.guild)
     try:
         role = await get_or_create_joined_role(interaction.guild)
     except discord.Forbidden:
@@ -164,7 +180,7 @@ async def setup(interaction: discord.Interaction, channel: discord.TextChannel) 
         f"Game set up in {channel.mention}. Messages there will be removed unless the user joins with `/join_game`. Only you can use `/start` and `/end` for this game.",
         ephemeral=True,
     )
-    await channel.send(f"A word game was set up here. Use `/join_game` to join. The game owner can use `/start` when ready.")
+    await channel.send("A word game was set up here. Use `/join_game` to join. The game owner can use `/start` when ready.")
 
 
 @tree.command(name="join_game", description="Join the current word game")
@@ -187,6 +203,9 @@ async def join_game(interaction: discord.Interaction) -> None:
         await interaction.user.add_roles(role, reason="Joined word game")
     except discord.Forbidden:
         await interaction.response.send_message("I cannot give that role. Move my bot role above the joined role and give me Manage Roles.", ephemeral=True)
+        return
+    except discord.HTTPException:
+        await interaction.response.send_message("Discord could not add the role. Please try again.", ephemeral=True)
         return
     state.scores.setdefault(interaction.user.id, 0)
     await interaction.response.send_message(f"You joined the game and received the {role.name} role.", ephemeral=True)
@@ -275,15 +294,15 @@ async def help_command(interaction: discord.Interaction) -> None:
         "`/word <word>` — selected player sets the secret word privately.\n"
         "`/hint <hint>` — selected player sends a hint for the current word.\n"
         "`/skip` — setup owner skips the current selected word setter.\n"
-        "`/del_chat` — setup owner deletes messages from the setup channel.\n"
+        "`/del_chat` — setup owner deletes recent messages from the setup channel.\n"
         "`/end` — setup owner ends the game, shows the top 10 leaderboard, and deletes the joined role.\n\n"
         "In the setup channel, messages from people who have not used `/join_game` are deleted. "
-        "Wrong guesses get ❌ and correct guesses get ✔️."
+        "Wrong guesses are marked as incorrect and correct guesses start the next round."
     )
     await interaction.response.send_message(help_text, ephemeral=True)
 
 
-@tree.command(name="del_chat", description="Delete messages from the setup channel")
+@tree.command(name="del_chat", description="Delete recent messages from the setup channel")
 async def del_chat(interaction: discord.Interaction) -> None:
     state = await interaction_owner_game_state(interaction)
     if not state or not interaction.guild:
@@ -294,14 +313,14 @@ async def del_chat(interaction: discord.Interaction) -> None:
         return
     await interaction.response.defer(ephemeral=True)
     try:
-        deleted = await channel.purge(limit=None, reason=f"Deleted by {interaction.user}")
+        deleted = await channel.purge(limit=100, reason=f"Deleted by {interaction.user}")
     except discord.Forbidden:
         await interaction.followup.send("I need the Manage Messages permission to delete chat.", ephemeral=True)
         return
     except discord.HTTPException:
         await interaction.followup.send("I could not delete the channel messages. Discord may block deleting very old messages in bulk.", ephemeral=True)
         return
-    await interaction.followup.send(f"Deleted {len(deleted)} messages from {channel.mention}.", ephemeral=True)
+    await interaction.followup.send(f"Deleted {len(deleted)} recent messages from {channel.mention}.", ephemeral=True)
 
 
 @tree.command(name="end", description="End the game and show the leaderboard")
@@ -326,10 +345,8 @@ async def on_message(message: discord.Message) -> None:
     if not has_joined_role(message.author, state):
         try:
             await message.delete()
-        except discord.Forbidden:
-            pass
-        except discord.HTTPException:
-            pass
+        except (discord.Forbidden, discord.HTTPException):
+            logger.warning("Could not delete message from non-joined member %s", message.author.id)
         return
     if not state.running or not state.current_word or not state.accepting_guess:
         return
@@ -339,32 +356,39 @@ async def on_message(message: discord.Message) -> None:
     if guess == state.current_word:
         state.accepting_guess = False
         state.scores[message.author.id] = state.scores.get(message.author.id, 0) + 1
-        try:
-            await message.add_reaction("✔️")
-        except discord.HTTPException:
-            pass
-        await message.channel.send(f"Correct, {message.author.mention}. The word was `{state.current_word}`. Next round starts in 5 seconds.")
+        await message.channel.send(
+            f"Correct, {message.author.mention}. The word was `{state.current_word}`. Next round starts in 5 seconds."
+        )
         current_round = state.round_number
         await asyncio.sleep(5)
         if state.running and games.get(message.guild.id) is state and state.round_number == current_round:
             await start_next_round(state)
     else:
-        try:
-            await message.add_reaction("❌")
-        except discord.HTTPException:
-            pass
+        await message.reply("Incorrect guess.", mention_author=False)
 
 
 @bot.event
 async def on_ready() -> None:
-    await tree.sync()
-    print(f"Logged in as {bot.user} and synced slash commands.")
+    global _synced_commands
+    if _synced_commands:
+        logger.info("Logged in as %s", bot.user)
+        return
+    try:
+        await tree.sync()
+    except discord.HTTPException:
+        logger.exception("Could not sync slash commands")
+        return
+    _synced_commands = True
+    logger.info("Logged in as %s and synced slash commands", bot.user)
 
 
 def main() -> None:
+    load_environment()
     token = os.environ.get(TOKEN_ENV_NAME)
     if not token:
-        raise RuntimeError(f"Missing {TOKEN_ENV_NAME}. Add your Discord bot token as a secret before starting the bot.")
+        raise RuntimeError(
+            f"Missing {TOKEN_ENV_NAME}. Add your Discord bot token as a Replit Secret or put it in a local .env file."
+        )
     bot.run(token)
 
 
