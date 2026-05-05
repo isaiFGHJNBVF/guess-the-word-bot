@@ -5,11 +5,6 @@ import random
 from dataclasses import dataclass, field
 from typing import Optional
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
-
 import discord
 from discord import app_commands
 
@@ -48,8 +43,7 @@ games: dict[int, GameState] = {}
 
 
 def load_environment() -> None:
-    if load_dotenv:
-        load_dotenv()
+    pass
 
 
 def joined_role_name() -> str:
@@ -357,7 +351,7 @@ async def on_message(message: discord.Message) -> None:
         state.accepting_guess = False
         state.scores[message.author.id] = state.scores.get(message.author.id, 0) + 1
         await message.channel.send(
-            f"Correct, {message.author.mention}. The word was `{state.current_word}`. Next round starts in 5 seconds."
+            f"Correct, {message.author.mention}! The word was `{state.current_word}`. Next round starts in 5 seconds."
         )
         current_round = state.round_number
         await asyncio.sleep(5)
@@ -387,7 +381,7 @@ def main() -> None:
     token = os.environ.get(TOKEN_ENV_NAME)
     if not token:
         raise RuntimeError(
-            f"Missing {TOKEN_ENV_NAME}. Add your Discord bot token as a Replit Secret or put it in a local .env file."
+            f"Missing {TOKEN_ENV_NAME}. Add your Discord bot token as a Replit Secret named DISCORD_BOT_TOKEN."
         )
     bot.run(token)
 
